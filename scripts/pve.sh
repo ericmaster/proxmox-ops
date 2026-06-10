@@ -5,12 +5,54 @@
 
 set -euo pipefail
 
-# Load credentials
-if [[ -f ~/.proxmox-credentials ]]; then
-    source ~/.proxmox-credentials
+# --- Parse --host / -h flag (must come before the command) ---
+PVE_TARGET_HOST=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --host|-h)
+            PVE_TARGET_HOST="${2:?--host requires a name}"
+            shift 2
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+# --- Load credentials ---
+JSON_CREDS="$HOME/.proxmox-credentials.json"
+LEGACY_CREDS="$HOME/.proxmox-credentials"
+
+if [[ -f "$JSON_CREDS" ]]; then
+    # Determine which host entry to use
+    if [[ -n "$PVE_TARGET_HOST" ]]; then
+        host_key="$PVE_TARGET_HOST"
+    else
+        host_key=$(jq -r '.default // empty' "$JSON_CREDS")
+    fi
+
+    if [[ -n "$host_key" ]]; then
+        entry=$(jq -e ".hosts[\"$host_key\"] // empty" "$JSON_CREDS" 2>/dev/null) || {
+            echo "Error: host '$host_key' not found in $JSON_CREDS" >&2
+            echo "Available hosts: $(jq -r '.hosts | keys | join(", ")' "$JSON_CREDS")" >&2
+            exit 1
+        }
+        export PROXMOX_HOST=$(jq -r '.PROXMOX_HOST' <<< "$entry")
+        export PROXMOX_TOKEN_ID=$(jq -r '.PROXMOX_TOKEN_ID' <<< "$entry")
+        export PROXMOX_TOKEN_SECRET=$(jq -r '.PROXMOX_TOKEN_SECRET' <<< "$entry")
+    fi
+elif [[ -f "$LEGACY_CREDS" ]]; then
+    # Legacy single-host fallback
+    source "$LEGACY_CREDS"
 fi
 
-: "${PROXMOX_HOST:?Set PROXMOX_HOST}"
+# If --host was given but no JSON file exists, that's an error
+if [[ -n "$PVE_TARGET_HOST" && ! -f "$JSON_CREDS" ]]; then
+    echo "Error: --host flag requires $JSON_CREDS to exist" >&2
+    exit 1
+fi
+
+: "${PROXMOX_HOST:?Set PROXMOX_HOST (via $JSON_CREDS or $LEGACY_CREDS or env vars)}"
 : "${PROXMOX_TOKEN_ID:?Set PROXMOX_TOKEN_ID}"
 : "${PROXMOX_TOKEN_SECRET:?Set PROXMOX_TOKEN_SECRET}"
 
@@ -155,7 +197,10 @@ case "$cmd" in
         cat << 'EOF'
 Proxmox VE CLI Helper
 
-Usage: pve.sh <command> [args]
+Usage: pve.sh [--host <name>] <command> [args]
+
+Options:
+  --host, -h <name>   Target a specific host from ~/.proxmox-credentials.json
 
 Commands:
   status              Show cluster nodes status
@@ -171,12 +216,19 @@ Commands:
   storage <node>      Show storage status
   ips [prefix]        List all configured IPs (filter by prefix, e.g. "10.10.20")
 
-Environment:
-  PROXMOX_HOST         https://your-proxmox:8006
-  PROXMOX_TOKEN_ID     user@pam!tokenname
-  PROXMOX_TOKEN_SECRET your-token-secret
+Configuration (checked in order):
+  1. ~/.proxmox-credentials.json   Multi-host JSON config (preferred)
+  2. ~/.proxmox-credentials        Legacy single-host env file (fallback)
+  3. Environment variables          PROXMOX_HOST, PROXMOX_TOKEN_ID, PROXMOX_TOKEN_SECRET
 
-Or create ~/.proxmox-credentials with these variables.
+JSON config example (~/.proxmox-credentials.json):
+  {
+    "default": "prod",
+    "hosts": {
+      "prod": { "PROXMOX_HOST": "https://10.0.0.10:8006", ... },
+      "dev":  { "PROXMOX_HOST": "https://10.0.0.20:8006", ... }
+    }
+  }
 EOF
         ;;
 esac

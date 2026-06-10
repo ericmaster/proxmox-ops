@@ -15,12 +15,12 @@ description: |
   Includes helper script (pve.sh) with auto node discovery from VMID, operational safety gates (read-only vs reversible vs destructive), vmstate snapshot warnings, post-resize guest filesystem steps, and a separate provisioning reference.
 
   Requires: curl, jq.
-  Credentials: PROXMOX_HOST, PROXMOX_TOKEN_ID, PROXMOX_TOKEN_SECRET — set as env vars or stored in ~/.proxmox-credentials (sourced at runtime, user-created, mode 600).
-  Writes: ~/.proxmox-credentials (user-created, API token, mode 600).
-  Network: connects to user-configured Proxmox host only (HTTPS, TLS verification disabled for self-signed certs).
+  Credentials: PROXMOX_HOST, PROXMOX_TOKEN_ID, PROXMOX_TOKEN_SECRET — loaded from ~/.proxmox-credentials.json (multi-host, preferred), ~/.proxmox-credentials (legacy single-host fallback), or env vars.
+  Writes: ~/.proxmox-credentials.json (user-created, API tokens, mode 600).
+  Network: connects to user-configured Proxmox host(s) only (HTTPS, TLS verification disabled for self-signed certs).
 
   Helper script: scripts/pve.sh (relative to this skill)
-  Configuration: ~/.proxmox-credentials
+  Configuration: ~/.proxmox-credentials.json (multi-host) or ~/.proxmox-credentials (legacy)
 metadata: { "openclaw": { "emoji": "🖥️", "homepage": "https://github.com/eddygk/proxmox-ops-skill", "requires": { "bins": ["curl", "jq"] }, "os": ["darwin", "linux"] } }
 ---
 
@@ -28,7 +28,37 @@ metadata: { "openclaw": { "emoji": "🖥️", "homepage": "https://github.com/ed
 
 ## First-Time Setup
 
-Create a credential file at `~/.proxmox-credentials`:
+### Multi-Host Configuration (recommended)
+
+Create a JSON configuration file at `~/.proxmox-credentials.json`:
+
+```bash
+cat > ~/.proxmox-credentials.json <<'EOF'
+{
+  "default": "prod",
+  "hosts": {
+    "prod": {
+      "PROXMOX_HOST": "https://10.0.0.10:8006",
+      "PROXMOX_TOKEN_ID": "user@pam!tokenname",
+      "PROXMOX_TOKEN_SECRET": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+    },
+    "dev": {
+      "PROXMOX_HOST": "https://10.0.0.20:8006",
+      "PROXMOX_TOKEN_ID": "dev@pam!tokenname",
+      "PROXMOX_TOKEN_SECRET": "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"
+    }
+  }
+}
+EOF
+chmod 600 ~/.proxmox-credentials.json
+```
+
+- `"default"` — the host used when `--host` is not specified
+- `"hosts"` — a map of friendly names to credentials; add as many as you need
+
+### Legacy Single-Host Setup (still supported)
+
+If you only have one host, the original env-file format still works as a fallback:
 
 ```bash
 cat > ~/.proxmox-credentials <<'EOF'
@@ -39,23 +69,38 @@ EOF
 chmod 600 ~/.proxmox-credentials
 ```
 
-**Alternative:** Set `PROXMOX_HOST`, `PROXMOX_TOKEN_ID`, and `PROXMOX_TOKEN_SECRET` as environment variables directly (useful for CI/agent contexts). The helper script checks env vars first, then falls back to sourcing `~/.proxmox-credentials`.
+**Credential loading order:** `~/.proxmox-credentials.json` → `~/.proxmox-credentials` → environment variables.
+
+**Alternative:** Set `PROXMOX_HOST`, `PROXMOX_TOKEN_ID`, and `PROXMOX_TOKEN_SECRET` as environment variables directly (useful for CI/agent contexts).
 
 Create API token in Proxmox: Datacenter → Permissions → API Tokens → Add. Use least-privilege: only grant the permissions your workflow requires (e.g., `PVEAuditor` for read-only monitoring, `PVEVMAdmin` for VM control). Disable Privilege Separation only if your workflow requires full API access.
 
 ## Auth Header
 
+When running raw curl commands (outside `pve.sh`), load credentials for the target host:
+
 ```bash
-source ~/.proxmox-credentials
+# From JSON config (replace "prod" with your host name):
+export PROXMOX_HOST=$(jq -r '.hosts.prod.PROXMOX_HOST' ~/.proxmox-credentials.json)
+export PROXMOX_TOKEN_ID=$(jq -r '.hosts.prod.PROXMOX_TOKEN_ID' ~/.proxmox-credentials.json)
+export PROXMOX_TOKEN_SECRET=$(jq -r '.hosts.prod.PROXMOX_TOKEN_SECRET' ~/.proxmox-credentials.json)
 AUTH="Authorization: PVEAPIToken=$PROXMOX_TOKEN_ID=$PROXMOX_TOKEN_SECRET"
+
+# Or from legacy env file:
+# source ~/.proxmox-credentials
+# AUTH="Authorization: PVEAPIToken=$PROXMOX_TOKEN_ID=$PROXMOX_TOKEN_SECRET"
 ```
 
 ## Helper Script
 
 `scripts/pve.sh` auto-discovers nodes from VMID — no need to specify the node for most operations.
 
+Use `--host <name>` to target a specific Proxmox host from `~/.proxmox-credentials.json`. If omitted, the `default` host is used.
+
 ```bash
-pve.sh status              # Cluster nodes overview
+pve.sh status              # Uses default host
+pve.sh --host dev status   # Target the "dev" host
+pve.sh --host prod vms     # List VMs on "prod"
 pve.sh vms [node]          # List all VMs (optionally filter by node)
 pve.sh lxc <node>          # List LXC containers on node
 pve.sh start <vmid>        # Start VM/LXC
@@ -66,19 +111,20 @@ pve.sh snap <vmid> [name]  # Create snapshot (disk-only, safe)
 pve.sh snapshots <vmid>    # List snapshots
 pve.sh tasks <node>        # Show recent tasks
 pve.sh storage <node>      # Show storage status
-pve.sh ips [prefix]        # List configured IPs across cluster (e.g. "10.10.20")
+pve.sh ips [prefix]        # List configured IPs across host (e.g. "10.10.20")
 ```
 
 ## Workflow
 
-1. **Load credentials** from `~/.proxmox-credentials`
-2. **Determine operation type:**
+1. **Identify the target host** — determine which Proxmox host the user is asking about. If ambiguous, ask which host. Use `--host <name>` with pve.sh or load the correct entry from the JSON config for raw curl commands
+2. **Load credentials** from `~/.proxmox-credentials.json` (or legacy fallback)
+3. **Determine operation type:**
    - **Read-only** (status, list, storage, tasks) → Execute directly
    - **Reversible** (start, stop, reboot, snapshot) → Execute, note UPID for tracking
    - **Destructive** (delete VM, resize disk, rollback snapshot) → Confirm with user first
-3. **Query Proxmox API** via curl + API token auth
-4. **Parse JSON** with jq
-5. **Track async tasks** — create/clone/backup operations return UPID
+4. **Query Proxmox API** via curl + API token auth
+5. **Parse JSON** with jq
+6. **Track async tasks** — create/clone/backup operations return UPID
 
 ## Common Operations
 
@@ -197,10 +243,10 @@ For create VM, create LXC, clone, convert to template, and delete operations:
 
 ## Security Notes
 
-- **Credential file** (`~/.proxmox-credentials`) is user-created, not auto-generated by this skill. Must be mode 600 (`chmod 600 ~/.proxmox-credentials`). Rotate tokens immediately if exposed
+- **Credential files** (`~/.proxmox-credentials.json` or `~/.proxmox-credentials`) are user-created, not auto-generated by this skill. Must be mode 600 (`chmod 600 ~/.proxmox-credentials.json`). Rotate tokens immediately if exposed
 - **TLS verification disabled** (`-k` / `--insecure`) — Proxmox VE uses self-signed certificates by default ([Proxmox docs](https://pve.proxmox.com/wiki/Certificate_Management)). If you deploy a trusted CA cert on your Proxmox node, remove the `-k` flag from curl commands and pve.sh
 - **Least-privilege tokens** — create tokens with only the roles your workflow needs. `PVEAuditor` for monitoring, `PVEVMAdmin` for VM ops. Full-access tokens are not required for most operations
-- **Network scope** — all API calls target `PROXMOX_HOST` only. No external endpoints. Verify by reviewing `scripts/pve.sh` (small, readable). In agent contexts, restrict network access to your Proxmox hosts only
+- **Network scope** — all API calls target the configured `PROXMOX_HOST` entries only. No external endpoints. Verify by reviewing `scripts/pve.sh` (small, readable). In agent contexts, restrict network access to your Proxmox hosts only
 - **API tokens** don't need CSRF tokens for POST/PUT/DELETE
 - **Power and delete operations are destructive** — confirm with user first
 - **Never expose credentials** in responses
