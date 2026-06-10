@@ -28,6 +28,12 @@ metadata: { "openclaw": { "emoji": "🖥️", "homepage": "https://github.com/ed
 
 ## First-Time Setup
 
+### Known Hosts (Environment)
+
+- **melchior** (192.168.1.141) — primary, Docker host
+- **casper** (192.168.1.114) — secondary, running various LXCs
+- Root access: `ssh -i ~/.ssh/id_rsa root@<proxmox-ip>`
+
 ### Multi-Host Configuration (recommended)
 
 Create a JSON configuration file at `~/.proxmox-credentials.json`:
@@ -256,3 +262,66 @@ For create VM, create LXC, clone, convert to template, and delete operations:
 - Replace `{node}`, `{vmid}`, `{storage}`, `{snapname}` with actual values
 - Task operations return UPID for tracking async jobs
 - Use `qemu` for VMs, `lxc` for containers in endpoint paths
+
+## Advanced Operations & Patterns
+
+### Container Inspection
+
+LXC exec via raw API returns `data:null` (async-only). Two approaches for synchronous access:
+
+**Via SSH on Proxmox host (recommended):**
+```bash
+ssh root@<proxmox-ip> "pct exec <vmid> -- command"
+# Multi-line:
+ssh root@<proxmox-ip> "pct exec <vmid> -- bash -c 'cmd1; cmd2'"
+# Pipe binary out:
+ssh root@<proxmox-ip> "pct exec <vmid> -- cat /path/to/file" > local-copy
+```
+
+**Raw API (async, use for background exec):**
+Returns UPID, poll `/nodes/{node}/tasks/{upid}/status`
+
+### Inspect Disk Usage Before Migration
+```bash
+ssh <host> "pct exec <vmid> -- df -h /"
+ssh <host> "pct exec <vmid> -- du -sh /opt /var/lib /root 2>/dev/null"
+```
+
+### LXC Migration Between Hosts
+
+**vzdump + SCP (Proxmox-native, preferred)**
+```bash
+# Source host
+vzdump <vmid> --compress zstd --storage local --dumpdir /var/lib/vz/dump
+# Copy to target
+scp /var/lib/vz/dump/vzdump-lxc-<vmid>-*.zst root@<target-ip>:/var/lib/vz/dump/
+# Restore on target
+NEWID=$(pvesh get /cluster/nextid)
+pct restore $NEWID /var/lib/vz/dump/vzdump-lxc-<vmid>-*.zst \
+  -storage local-lvm -rootfs local-lvm:<size>G
+```
+
+**tar backup + scp (alternative)**
+```bash
+ssh <source> "pct exec <vmid> -- tar czf /tmp/backup.tar.gz -C /path ."
+ssh <source> "pct exec <vmid> -- cat /tmp/backup.tar.gz" > backup.tar.gz
+scp backup.tar.gz <target>:
+```
+
+**Large container warning:** Containers with >100GB disks should be inspected first. Media-heavy projects may be better recreated fresh (git clone + Docker Compose) than full LXC migration.
+
+### LXC Decommission Pattern
+
+```bash
+# 1. Snapshot for rollback
+ssh <host> "pct snapshot <vmid> pre-decommission"
+
+# 2. Backup bind mount data (Docker volumes, DBs)
+ssh <host> "pct exec <vmid> -- cat /tmp/data.tar.gz" > local-backup.tar.gz
+
+# 3. Stop
+ssh <host> "pct stop <vmid>"
+
+# 4. Destroy (auto-removes snapshot + disk)
+ssh <host> "pct destroy <vmid> --purge"
+```
