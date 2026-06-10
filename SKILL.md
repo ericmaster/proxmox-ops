@@ -30,9 +30,7 @@ metadata: { "openclaw": { "emoji": "🖥️", "homepage": "https://github.com/ed
 
 ### Known Hosts (Environment)
 
-- **melchior** (192.168.1.141) — primary, Docker host
-- **casper** (192.168.1.114) — secondary, running various LXCs
-- Root access: `ssh -i ~/.ssh/id_rsa root@<proxmox-ip>`
+*Environment-specific host IPs, roles, and SSH details can be documented locally in `references/environment.md` (this file is gitignored). Check if it exists for local context.*
 
 ### Multi-Host Configuration (recommended)
 
